@@ -10,6 +10,10 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 ![No API keys](https://img.shields.io/badge/API_keys-none_required-success)
 
+<br/>
+
+<img src="docs/dashboard.png" alt="Dashboard — taker rebate metrics and a clean cumulative realized P/L curve" width="920" />
+
 </div>
 
 ---
