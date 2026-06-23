@@ -736,7 +736,7 @@ function PnlChart({ report }: { report: RebateReport | null }): React.ReactEleme
   }
 
   const spanDays = (data[data.length - 1].t - data[0].t) / 86_400;
-  const intraday = spanDays <= 2;
+  const intraday = spanDays <= 3;
   const positive = data[data.length - 1].p >= 0;
   const stroke = positive ? "var(--green)" : "var(--red)";
 
