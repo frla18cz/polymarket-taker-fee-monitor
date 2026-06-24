@@ -4,6 +4,10 @@ import { DAY_SECONDS, DEFAULT_WALLET, type RangeMode, type ReportRange, validate
 import { buildRebateReport } from "@/lib/polymarket";
 
 export const dynamic = "force-dynamic";
+// Active wallets fan out one Gamma metadata fetch per unique market, so a cold request can
+// run ~15-20s. Vercel's default function timeout is 10s; 60s is the Hobby-plan max and gives
+// comfortable headroom. Pro plans can raise this further if needed for very large wallets.
+export const maxDuration = 60;
 
 const MAX_RANGE_DAYS = 365;
 

@@ -16,7 +16,7 @@ const TRADE_PAGE_LIMIT = 1_000;
 const POSITION_PAGE_LIMIT = 500;
 const ACTIVITY_PAGE_LIMIT = 500;
 const MAX_DATA_API_OFFSET = 10_000;
-const EVENT_CONCURRENCY = 8;
+const EVENT_CONCURRENCY = 16;
 
 export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
