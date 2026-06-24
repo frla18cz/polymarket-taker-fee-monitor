@@ -126,11 +126,42 @@ export interface ActivityEvent {
   title?: string;
 }
 
+// One resolved market with its net realized cashflow and resolution time.
+// conditionId lets us join back to the originating trades for asset/direction/entry.
+export interface ResolvedMarket {
+  conditionId: string;
+  pnl: number;
+  resolvedAt: number;
+}
+
 export interface RealizedPnl {
   series: PnlPoint[];
   realizedTotal: number;
   resolvedMarkets: number;
   losingMarkets: number;
+  markets: ResolvedMarket[];
+}
+
+export type TradeDirection = "Up" | "Down" | "Yes" | "No" | "Other";
+
+// A resolved market enriched with the metadata needed to analyse a strategy:
+// the crypto asset, the direction bet, the average entry price and realized P/L.
+export interface ClosedPosition {
+  conditionId: string;
+  title: string;
+  slug: string | null;
+  asset: string;
+  isCrypto: boolean;
+  category: CategoryKey;
+  categoryLabel: string;
+  direction: TradeDirection;
+  entryPrice: number | null;
+  cost: number;
+  proceeds: number;
+  realizedPnl: number;
+  openedAt: number;
+  resolvedAt: number;
+  tradeCount: number;
 }
 
 const REALIZED_INCOME_TYPES = new Set(["REDEEM", "REWARD", "MAKER_REBATE"]);
@@ -170,7 +201,11 @@ export function buildRealizedPnl(events: ActivityEvent[], positions?: Polymarket
     }
   }
 
-  const markets = Array.from(resolvedAt.entries()).map(([conditionId, t]) => ({ t, p: net.get(conditionId) ?? 0 }));
+  const markets: ResolvedMarket[] = Array.from(resolvedAt.entries()).map(([conditionId, t]) => ({
+    conditionId,
+    resolvedAt: t,
+    pnl: net.get(conditionId) ?? 0
+  }));
 
   const nowSec = Math.floor(Date.now() / 1000);
   for (const position of positions ?? []) {
@@ -192,23 +227,180 @@ export function buildRealizedPnl(events: ActivityEvent[], positions?: Polymarket
     const pnl = settledValue - (position.initialValue ?? 0);
     const resolvedSec = parseSlugTimeSec(position.slug) ?? nowSec;
     resolvedAt.set(conditionId, resolvedSec);
-    markets.push({ t: resolvedSec, p: pnl });
+    markets.push({ conditionId, resolvedAt: resolvedSec, pnl });
   }
 
-  markets.sort((a, b) => a.t - b.t);
+  markets.sort((a, b) => a.resolvedAt - b.resolvedAt);
 
   let cumulative = 0;
   const series: PnlPoint[] = markets.map((market) => {
-    cumulative += market.p;
-    return { t: market.t, p: cumulative };
+    cumulative += market.pnl;
+    return { t: market.resolvedAt, p: cumulative };
   });
 
   return {
     series,
     realizedTotal: cumulative,
     resolvedMarkets: markets.length,
-    losingMarkets: markets.filter((market) => market.p < 0).length
+    losingMarkets: markets.filter((market) => market.pnl < 0).length,
+    markets
   };
+}
+
+// Friendly symbols for the recurring crypto up/down markets. Unknown tokens fall back
+// to the uppercased slug segment, so a new ticker (e.g. "ada-updown-5m") still shows
+// as "ADA" without a code change.
+const CRYPTO_SLUG_SYMBOLS: Record<string, string> = {
+  btc: "BTC",
+  bitcoin: "BTC",
+  eth: "ETH",
+  ethereum: "ETH",
+  sol: "SOL",
+  solana: "SOL",
+  xrp: "XRP",
+  ripple: "XRP",
+  doge: "DOGE",
+  dogecoin: "DOGE",
+  bnb: "BNB",
+  hype: "HYPE",
+  hyperliquid: "HYPE",
+  ada: "ADA",
+  cardano: "ADA",
+  ltc: "LTC",
+  litecoin: "LTC",
+  avax: "AVAX",
+  avalanche: "AVAX",
+  link: "LINK",
+  chainlink: "LINK",
+  matic: "MATIC",
+  polygon: "MATIC",
+  dot: "DOT",
+  polkadot: "DOT",
+  trx: "TRX",
+  tron: "TRX",
+  shib: "SHIB",
+  pepe: "PEPE",
+  sui: "SUI",
+  apt: "APT",
+  ton: "TON",
+  near: "NEAR"
+};
+
+// Extracts the crypto asset and whether a market is a crypto up/down market. Recurring
+// markets encode the token as the leading slug segment, e.g. "hype-updown-5m-…".
+export function parseCryptoAsset(slug: string | null | undefined): { asset: string; isCrypto: boolean } {
+  if (slug) {
+    const updown = slug.match(/^([a-z0-9]+)-updown(?:-|$)/);
+    if (updown) {
+      const token = updown[1];
+      return { asset: CRYPTO_SLUG_SYMBOLS[token] ?? token.toUpperCase(), isCrypto: true };
+    }
+
+    const leading = slug.match(/^([a-z0-9]+)(?:-|$)/);
+    if (leading && CRYPTO_SLUG_SYMBOLS[leading[1]]) {
+      return { asset: CRYPTO_SLUG_SYMBOLS[leading[1]], isCrypto: true };
+    }
+  }
+
+  return { asset: "—", isCrypto: false };
+}
+
+function normalizeDirection(outcome: string | null | undefined): TradeDirection {
+  switch ((outcome ?? "").trim().toLowerCase()) {
+    case "up":
+      return "Up";
+    case "down":
+      return "Down";
+    case "yes":
+      return "Yes";
+    case "no":
+      return "No";
+    default:
+      return "Other";
+  }
+}
+
+// Joins each resolved market (net realized cashflow) back to its originating trades to
+// recover asset, direction and average entry price. Falls back to the positions snapshot
+// for markets whose trades are outside the fetched window.
+export function buildClosedPositions(
+  markets: ResolvedMarket[],
+  trades: PolymarketTrade[],
+  positions?: PolymarketPosition[] | null,
+  eventsBySlug?: Record<string, GammaEvent | null>
+): ClosedPosition[] {
+  const tradesByCondition = new Map<string, PolymarketTrade[]>();
+  for (const trade of trades) {
+    if (!trade.conditionId) {
+      continue;
+    }
+    const list = tradesByCondition.get(trade.conditionId);
+    if (list) {
+      list.push(trade);
+    } else {
+      tradesByCondition.set(trade.conditionId, [trade]);
+    }
+  }
+
+  const positionByCondition = new Map<string, PolymarketPosition>();
+  for (const position of positions ?? []) {
+    if (position.conditionId) {
+      positionByCondition.set(position.conditionId, position);
+    }
+  }
+
+  const closed: ClosedPosition[] = [];
+  for (const market of markets) {
+    const marketTrades = tradesByCondition.get(market.conditionId) ?? [];
+    const buys = marketTrades.filter((trade) => trade.side === "BUY");
+    const position = positionByCondition.get(market.conditionId);
+
+    const sample = marketTrades[0];
+    const slug = sample?.eventSlug ?? sample?.slug ?? position?.slug ?? null;
+    const title = sample?.title ?? position?.title ?? market.conditionId;
+    const outcome = sample?.outcome ?? position?.outcome;
+
+    let cost: number;
+    let entryPrice: number | null;
+    if (buys.length > 0) {
+      const sizeSum = sum(buys, (trade) => trade.size);
+      cost = sum(buys, (trade) => trade.size * trade.price);
+      entryPrice = sizeSum > 0 ? cost / sizeSum : null;
+    } else {
+      cost = position?.initialValue ?? 0;
+      entryPrice = Number.isFinite(position?.avgPrice) ? (position?.avgPrice as number) : null;
+    }
+
+    const { asset, isCrypto } = parseCryptoAsset(slug);
+    const event = eventsBySlug?.[slug ?? ""];
+    const inference = sample ? inferTradeCategory(sample, event) : null;
+    const category: CategoryKey = inference?.category ?? (isCrypto ? "crypto" : "other");
+    const openedAt = marketTrades.reduce<number>(
+      (min, trade) => (Number.isFinite(trade.timestamp) ? Math.min(min, trade.timestamp) : min),
+      market.resolvedAt
+    );
+
+    closed.push({
+      conditionId: market.conditionId,
+      title,
+      slug,
+      asset,
+      isCrypto,
+      category,
+      categoryLabel: CATEGORY_CONFIG[category].label,
+      direction: normalizeDirection(outcome),
+      entryPrice,
+      cost,
+      proceeds: market.pnl + cost,
+      realizedPnl: market.pnl,
+      openedAt,
+      resolvedAt: market.resolvedAt,
+      tradeCount: marketTrades.length
+    });
+  }
+
+  closed.sort((a, b) => b.resolvedAt - a.resolvedAt);
+  return closed;
 }
 
 const FIVE_MINUTES = 300;
@@ -318,6 +510,7 @@ export interface RebateReport {
   realizedTotal: number | null;
   resolvedMarkets: number;
   losingMarkets: number;
+  closedPositions: ClosedPosition[];
   warnings: string[];
   api: {
     tradePages: number;
@@ -557,6 +750,11 @@ export function aggregateRebateReport(input: {
     realizedTotal: input.realized ? input.realized.realizedTotal : null,
     resolvedMarkets: input.realized?.resolvedMarkets ?? 0,
     losingMarkets: input.realized?.losingMarkets ?? 0,
+    closedPositions: input.realized
+      ? buildClosedPositions(input.realized.markets, input.trades, input.positions, input.eventsBySlug).filter(
+          (position) => position.resolvedAt >= input.range.startSec && position.resolvedAt <= input.range.endSec
+        )
+      : [],
     warnings: Array.from(new Set(warnings)),
     api: {
       tradePages: input.api?.tradePages ?? 0,

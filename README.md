@@ -56,6 +56,7 @@ Open **http://localhost:3000** and paste any Polymarket wallet address.
 | Variable | Description |
 | --- | --- |
 | `NEXT_PUBLIC_DEFAULT_WALLET` | *Optional.* Wallet the dashboard auto-loads on first paint. Leave unset to start with an empty field. |
+| `NEXT_PUBLIC_DEFAULT_TZ` | *Optional.* Default display timezone for the time toggle (IANA name, e.g. `Europe/Prague`). DST handled automatically. Unset → UTC; users can switch between UTC and their local timezone in the UI. |
 
 `.env.local` is git-ignored — your wallet never gets committed.
 

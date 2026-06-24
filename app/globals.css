@@ -154,6 +154,14 @@ button:disabled {
   background: var(--surface-muted);
 }
 
+.tabSwitcher {
+  margin-bottom: 4px;
+}
+
+.tabSwitcher .segmented {
+  padding: 0 22px;
+}
+
 .segmented {
   min-height: 42px;
   border: 0;

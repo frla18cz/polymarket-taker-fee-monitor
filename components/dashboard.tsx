@@ -1,12 +1,13 @@
 "use client";
 
-import { AlertTriangle, CalendarDays, Download, RefreshCw, Search, Wallet } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, CalendarDays, Clock, Download, RefreshCw, Search, Wallet } from "lucide-react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
   Bar,
   CartesianGrid,
+  Cell,
   ComposedChart,
   Line,
   ReferenceLine,
@@ -16,11 +17,18 @@ import {
   YAxis
 } from "recharts";
 
-import { tradesToCsv, positionsToCsv } from "@/lib/csv";
-import { DEFAULT_WALLET, pnlTotal, validateWallet, type RebateReport } from "@/lib/rebate";
+import { tradesToCsv, positionsToCsv, closedPositionsToCsv } from "@/lib/csv";
+import {
+  DEFAULT_WALLET,
+  pnlTotal,
+  validateWallet,
+  type ClosedPosition,
+  type RebateReport
+} from "@/lib/rebate";
 
 type RangeValue = "7" | "14" | "30" | "90" | "custom";
 type PresetMode = "live" | "checkpoint";
+type TabValue = "overview" | "crypto";
 
 type DailyMetric = "weightedVolume" | "rawVolume" | "takerFee" | "tradeCount";
 type ChartMetric = DailyMetric | "pnl";
@@ -59,27 +67,50 @@ const percentFormatter = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 0
 });
 
-const utcDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  month: "short",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-  timeZone: "UTC",
-  timeZoneName: "short"
-});
+// Display timezone is user-selectable. The "Local" option defaults to NEXT_PUBLIC_DEFAULT_TZ
+// (set in .env.local) and otherwise to the viewer's own browser timezone; the repo default
+// stays UTC so a fresh checkout is timezone-neutral.
+const ENV_DEFAULT_TZ = (process.env.NEXT_PUBLIC_DEFAULT_TZ ?? "").trim();
 
-const utcDateFormatter = new Intl.DateTimeFormat(undefined, {
-  month: "short",
-  day: "numeric",
-  timeZone: "UTC"
-});
+const TimeZoneContext = createContext<string>("UTC");
 
-const utcTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  hour: "2-digit",
-  minute: "2-digit",
-  timeZone: "UTC",
-  hourCycle: "h23"
-});
+function useTimeZone(): string {
+  return useContext(TimeZoneContext);
+}
+
+const dateTimeFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function zonedFormatter(kind: string, timeZone: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const cacheKey = `${kind}|${timeZone}`;
+  let formatter = dateTimeFormatterCache.get(cacheKey);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, { ...options, timeZone });
+    dateTimeFormatterCache.set(cacheKey, formatter);
+  }
+  return formatter;
+}
+
+// en-US so the short weekday is stable ("Mon") for mapping to an index, independent of locale.
+const zonedPartsCache = new Map<string, Intl.DateTimeFormat>();
+
+function zonedParts(timeZone: string): Intl.DateTimeFormat {
+  let formatter = zonedPartsCache.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", hour: "2-digit", hourCycle: "h23" });
+    zonedPartsCache.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6
+};
 
 export function Dashboard(): React.ReactElement {
   const [wallet, setWallet] = useState(DEFAULT_WALLET);
@@ -91,14 +122,35 @@ export function Dashboard(): React.ReactElement {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("weightedVolume");
+  const [activeTab, setActiveTab] = useState<TabValue>("overview");
+  // Local timezone for the "Local" toggle: env override first, then the browser tz (resolved
+  // after mount to avoid an SSR/client hydration mismatch).
+  const [localTz, setLocalTz] = useState(ENV_DEFAULT_TZ || "UTC");
+  const [useUtc, setUseUtc] = useState(!ENV_DEFAULT_TZ || ENV_DEFAULT_TZ.toUpperCase() === "UTC");
+
+  useEffect(() => {
+    if (!ENV_DEFAULT_TZ) {
+      try {
+        const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (resolved) {
+          setLocalTz(resolved);
+        }
+      } catch {
+        // keep UTC fallback
+      }
+    }
+  }, []);
+
+  const timeZone = useUtc ? "UTC" : localTz;
+  const localTzLabel = localTz === "UTC" ? "Local" : (localTz.split("/").pop() ?? localTz).replace(/_/g, " ");
 
   const rangeLabel = useMemo(() => {
     if (!report) {
       return "No range loaded";
     }
 
-    return `${formatUtcDateTime(report.range.startSec)} to ${formatUtcDateTime(report.range.endSec)}`;
-  }, [report]);
+    return `${formatZonedDateTime(report.range.startSec, timeZone)} to ${formatZonedDateTime(report.range.endSec, timeZone)}`;
+  }, [report, timeZone]);
 
   async function loadReport(): Promise<void> {
     const trimmedWallet = wallet.trim();
@@ -151,6 +203,7 @@ export function Dashboard(): React.ReactElement {
   }, []);
 
   return (
+    <TimeZoneContext.Provider value={timeZone}>
     <main className="shell">
       <section className="toolbar" aria-label="Report controls">
         <div className="titleBlock">
@@ -209,6 +262,26 @@ export function Dashboard(): React.ReactElement {
             </button>
           </div>
 
+          <div className="controlGroup" role="group" aria-label="Timezone">
+            <button
+              className={useUtc ? "segmented active" : "segmented"}
+              onClick={() => setUseUtc(true)}
+              type="button"
+              title="Show all times in UTC"
+            >
+              <Clock size={14} aria-hidden="true" />
+              UTC
+            </button>
+            <button
+              className={!useUtc ? "segmented active" : "segmented"}
+              onClick={() => setUseUtc(false)}
+              type="button"
+              title={`Show all times in ${localTz}`}
+            >
+              {localTzLabel}
+            </button>
+          </div>
+
           {rangeValue === "custom" ? (
             <div className="dateRow">
               <label className="field">
@@ -253,6 +326,31 @@ export function Dashboard(): React.ReactElement {
         </section>
       ) : null}
 
+      <div className="controlGroup tabSwitcher" role="tablist" aria-label="View">
+        <button
+          className={activeTab === "overview" ? "segmented active" : "segmented"}
+          onClick={() => setActiveTab("overview")}
+          role="tab"
+          aria-selected={activeTab === "overview"}
+          type="button"
+        >
+          Overview
+        </button>
+        <button
+          className={activeTab === "crypto" ? "segmented active" : "segmented"}
+          onClick={() => setActiveTab("crypto")}
+          role="tab"
+          aria-selected={activeTab === "crypto"}
+          type="button"
+        >
+          Crypto strategy
+        </button>
+      </div>
+
+      {activeTab === "crypto" ? (
+        <CryptoStrategyTab report={report} isLoading={isLoading} />
+      ) : (
+      <>
       <section className="metricGrid" aria-busy={isLoading}>
         <MetricCard label="Estimated weighted volume" value={formatUsd(report?.totals.weightedVolume)} detail="Rolling wV" />
         <MetricCard
@@ -324,7 +422,14 @@ export function Dashboard(): React.ReactElement {
       </section>
 
       <PositionsSection report={report} />
+
+      <section className="panel">
+        <ClosedPositionsTable report={report} cryptoOnly={false} />
+      </section>
+      </>
+      )}
     </main>
+    </TimeZoneContext.Provider>
   );
 }
 
@@ -481,6 +586,7 @@ function TopEvents({ report }: { report: RebateReport | null }): React.ReactElem
 }
 
 function TradesTable({ report }: { report: RebateReport | null }): React.ReactElement {
+  const timeZone = useTimeZone();
   const [query, setQuery] = useState("");
   const [sideFilter, setSideFilter] = useState<"all" | "BUY" | "SELL">("all");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
@@ -623,7 +729,7 @@ function TradesTable({ report }: { report: RebateReport | null }): React.ReactEl
               <tbody>
                 {visible.map((trade) => (
                   <tr key={`${trade.transactionHash}-${trade.asset}-${trade.timestamp}-${trade.size}`}>
-                    <td>{formatUtcDateTime(trade.timestamp)}</td>
+                    <td>{formatZonedDateTime(trade.timestamp, timeZone)}</td>
                     <td className="marketCell">{trade.title}</td>
                     <td>
                       <span className={trade.side === "BUY" ? "side buy" : "side sell"}>{trade.side}</span>
@@ -720,6 +826,7 @@ function PositionsSection({ report }: { report: RebateReport | null }): React.Re
 }
 
 function PnlChart({ report }: { report: RebateReport | null }): React.ReactElement {
+  const timeZone = useTimeZone();
   const history = report?.pnlHistory ?? null;
   const data = useMemo(() => (history ?? []).map((point) => ({ t: point.t, p: point.p })), [history]);
 
@@ -759,7 +866,7 @@ function PnlChart({ report }: { report: RebateReport | null }): React.ReactEleme
             stroke="var(--chart-axis)"
             tick={{ fontSize: 11 }}
             minTickGap={56}
-            tickFormatter={(value: number) => (intraday ? formatUtcTime(value) : formatUtcDate(value))}
+            tickFormatter={(value: number) => (intraday ? formatZonedTime(value, timeZone) : formatZonedDate(value, timeZone))}
           />
           <YAxis
             stroke="var(--chart-axis)"
@@ -775,7 +882,7 @@ function PnlChart({ report }: { report: RebateReport | null }): React.ReactEleme
               fontSize: 12
             }}
             labelStyle={{ color: "var(--chart-axis)" }}
-            labelFormatter={(value) => formatUtcDateTime(Number(value))}
+            labelFormatter={(value) => formatZonedDateTime(Number(value), timeZone)}
             formatter={(value) => [formatSignedUsd(Number(value)), "Realized P/L"]}
           />
           <ReferenceLine y={0} stroke="var(--chart-axis)" strokeDasharray="3 3" />
@@ -839,6 +946,429 @@ function PositionsTable({ report }: { report: RebateReport | null }): React.Reac
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+type ClosedSortKey = "resolvedAt" | "realizedPnl" | "entryPrice" | "cost";
+
+const CLOSED_PAGE_SIZE = 50;
+
+function ClosedPositionsTable({
+  report,
+  cryptoOnly
+}: {
+  report: RebateReport | null;
+  cryptoOnly: boolean;
+}): React.ReactElement {
+  const timeZone = useTimeZone();
+  const [assetFilter, setAssetFilter] = useState<string>("all");
+  const [directionFilter, setDirectionFilter] = useState<"all" | "Up" | "Down">("all");
+  const [resultFilter, setResultFilter] = useState<"all" | "win" | "loss">("all");
+  const [sortKey, setSortKey] = useState<ClosedSortKey>("resolvedAt");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [visibleCount, setVisibleCount] = useState(CLOSED_PAGE_SIZE);
+
+  const base = useMemo(() => {
+    const all = report?.closedPositions ?? [];
+    return cryptoOnly ? all.filter((position) => position.isCrypto) : all;
+  }, [report, cryptoOnly]);
+
+  const assets = useMemo(() => {
+    return Array.from(new Set(base.map((position) => position.asset))).sort();
+  }, [base]);
+
+  const filtered = useMemo(() => {
+    const rows = base.filter((position) => {
+      if (assetFilter !== "all" && position.asset !== assetFilter) {
+        return false;
+      }
+      if (directionFilter !== "all" && position.direction !== directionFilter) {
+        return false;
+      }
+      if (resultFilter === "win" && position.realizedPnl <= 0) {
+        return false;
+      }
+      if (resultFilter === "loss" && position.realizedPnl >= 0) {
+        return false;
+      }
+      return true;
+    });
+
+    const direction = sortDir === "asc" ? 1 : -1;
+    return [...rows].sort((a, b) => ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * direction);
+  }, [base, assetFilter, directionFilter, resultFilter, sortKey, sortDir]);
+
+  useEffect(() => {
+    setVisibleCount(CLOSED_PAGE_SIZE);
+  }, [assetFilter, directionFilter, resultFilter, sortKey, sortDir, base]);
+
+  function toggleSort(key: ClosedSortKey): void {
+    if (sortKey === key) {
+      setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  }
+
+  function sortIndicator(key: ClosedSortKey): string {
+    if (sortKey !== key) {
+      return "";
+    }
+    return sortDir === "asc" ? " ▲" : " ▼";
+  }
+
+  const total = base.length;
+  const visible = filtered.slice(0, visibleCount);
+  const heading = cryptoOnly ? "Closed crypto positions" : "Closed positions";
+
+  return (
+    <div>
+      <div className="panelHeader">
+        <div>
+          <h2>{heading}</h2>
+          <p className="panelNote">
+            Realized P/L per resolved market (buys paired to redeem / sell proceeds). Same data as the P/L curve — broken
+            out per position.
+          </p>
+        </div>
+        <span>
+          {filtered.length} of {total}
+        </span>
+      </div>
+
+      <div className="tableControls">
+        <label className="field">
+          <span>Asset</span>
+          <select value={assetFilter} onChange={(event) => setAssetFilter(event.target.value)}>
+            <option value="all">All assets</option>
+            {assets.map((asset) => (
+              <option key={asset} value={asset}>
+                {asset}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="controlGroup" role="group" aria-label="Direction filter">
+          {(["all", "Up", "Down"] as const).map((value) => (
+            <button
+              className={directionFilter === value ? "segmented active" : "segmented"}
+              key={value}
+              onClick={() => setDirectionFilter(value)}
+              type="button"
+            >
+              {value === "all" ? "All" : value}
+            </button>
+          ))}
+        </div>
+
+        <div className="controlGroup" role="group" aria-label="Result filter">
+          {(["all", "win", "loss"] as const).map((value) => (
+            <button
+              className={resultFilter === value ? "segmented active" : "segmented"}
+              key={value}
+              onClick={() => setResultFilter(value)}
+              type="button"
+            >
+              {value === "all" ? "All" : value === "win" ? "Wins" : "Losses"}
+            </button>
+          ))}
+        </div>
+
+        <button
+          className="ghostButton"
+          type="button"
+          disabled={filtered.length === 0}
+          onClick={() => downloadCsv(closedPositionsToCsv(filtered), csvName(report, "closed-positions"))}
+        >
+          <Download size={16} aria-hidden="true" />
+          Export CSV
+        </button>
+      </div>
+
+      {total === 0 ? (
+        <div className="emptyState">No closed positions in this range.</div>
+      ) : filtered.length === 0 ? (
+        <div className="emptyState">No closed positions match the current filters.</div>
+      ) : (
+        <>
+          <div className="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th className="sortable" onClick={() => toggleSort("resolvedAt")}>Resolved{sortIndicator("resolvedAt")}</th>
+                  <th>Asset</th>
+                  <th>Market</th>
+                  <th>Direction</th>
+                  <th className="sortable" onClick={() => toggleSort("entryPrice")}>Entry{sortIndicator("entryPrice")}</th>
+                  <th className="sortable" onClick={() => toggleSort("cost")}>Cost{sortIndicator("cost")}</th>
+                  <th>Proceeds</th>
+                  <th className="sortable" onClick={() => toggleSort("realizedPnl")}>P/L{sortIndicator("realizedPnl")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((position) => (
+                  <tr key={position.conditionId}>
+                    <td>{formatZonedDateTime(position.resolvedAt, timeZone)}</td>
+                    <td>{position.asset}</td>
+                    <td className="marketCell">{position.title}</td>
+                    <td>
+                      <span className={position.direction === "Up" ? "side buy" : position.direction === "Down" ? "side sell" : "side"}>
+                        {position.direction}
+                      </span>
+                    </td>
+                    <td>{position.entryPrice === null ? "-" : formatNumber(position.entryPrice)}</td>
+                    <td>{formatUsd(position.cost)}</td>
+                    <td>{formatUsd(position.proceeds)}</td>
+                    <td className={pnlTone(position.realizedPnl)}>{formatSignedUsd(position.realizedPnl)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {visibleCount < filtered.length ? (
+            <div className="loadMore">
+              <button
+                className="ghostButton"
+                type="button"
+                onClick={() => setVisibleCount((count) => count + CLOSED_PAGE_SIZE)}
+              >
+                Load more ({filtered.length - visibleCount} remaining)
+              </button>
+            </div>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+interface GroupStat {
+  key: string;
+  pnl: number;
+  count: number;
+  wins: number;
+  winRate: number;
+  avgPnl: number;
+}
+
+function groupPnl(items: ClosedPosition[], keyOf: (item: ClosedPosition) => string): GroupStat[] {
+  const buckets = new Map<string, { pnl: number; count: number; wins: number }>();
+  for (const item of items) {
+    const key = keyOf(item);
+    const bucket = buckets.get(key) ?? { pnl: 0, count: 0, wins: 0 };
+    bucket.pnl += item.realizedPnl;
+    bucket.count += 1;
+    if (item.realizedPnl > 0) {
+      bucket.wins += 1;
+    }
+    buckets.set(key, bucket);
+  }
+
+  return Array.from(buckets.entries()).map(([key, bucket]) => ({
+    key,
+    pnl: bucket.pnl,
+    count: bucket.count,
+    wins: bucket.wins,
+    winRate: bucket.count > 0 ? bucket.wins / bucket.count : 0,
+    avgPnl: bucket.count > 0 ? bucket.pnl / bucket.count : 0
+  }));
+}
+
+const ENTRY_PRICE_BUCKETS: Array<{ label: string; test: (price: number) => boolean }> = [
+  { label: "<0.90", test: (price) => price < 0.9 },
+  { label: "0.90–0.95", test: (price) => price >= 0.9 && price < 0.95 },
+  { label: "0.95–0.98", test: (price) => price >= 0.95 && price < 0.98 },
+  { label: "0.98–0.99", test: (price) => price >= 0.98 && price < 0.99 },
+  { label: "≥0.99", test: (price) => price >= 0.99 }
+];
+
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function entryPriceBucket(price: number | null): string {
+  if (price === null || !Number.isFinite(price)) {
+    return "unknown";
+  }
+  return ENTRY_PRICE_BUCKETS.find((bucket) => bucket.test(price))?.label ?? "unknown";
+}
+
+function CryptoStrategyTab({
+  report,
+  isLoading
+}: {
+  report: RebateReport | null;
+  isLoading: boolean;
+}): React.ReactElement {
+  const timeZone = useTimeZone();
+  const tzLabel = timeZone === "UTC" ? "UTC" : (timeZone.split("/").pop() ?? timeZone).replace(/_/g, " ");
+  const crypto = useMemo(() => (report?.closedPositions ?? []).filter((position) => position.isCrypto), [report]);
+
+  const stats = useMemo(() => {
+    const count = crypto.length;
+    const pnl = crypto.reduce((total, position) => total + position.realizedPnl, 0);
+    const wins = crypto.filter((position) => position.realizedPnl > 0).length;
+    return {
+      count,
+      pnl,
+      wins,
+      winRate: count > 0 ? wins / count : 0,
+      avgPnl: count > 0 ? pnl / count : 0
+    };
+  }, [crypto]);
+
+  const byAsset = useMemo(
+    () => groupPnl(crypto, (item) => item.asset).sort((a, b) => b.pnl - a.pnl),
+    [crypto]
+  );
+  const byDirection = useMemo(() => groupPnl(crypto, (item) => item.direction), [crypto]);
+  const byHour = useMemo(() => {
+    const stats = groupPnl(crypto, (item) => String(zonedHourWeekday(item.openedAt, timeZone).hour));
+    const byKey = new Map(stats.map((stat) => [stat.key, stat]));
+    return Array.from({ length: 24 }, (_, hour) => {
+      const stat = byKey.get(String(hour));
+      return {
+        key: `${String(hour).padStart(2, "0")}h`,
+        pnl: stat?.pnl ?? 0,
+        count: stat?.count ?? 0,
+        wins: stat?.wins ?? 0,
+        winRate: stat?.winRate ?? 0,
+        avgPnl: stat?.avgPnl ?? 0
+      };
+    });
+  }, [crypto, timeZone]);
+  const byWeekday = useMemo(() => {
+    const stats = groupPnl(crypto, (item) => String(zonedHourWeekday(item.openedAt, timeZone).weekday));
+    const byKey = new Map(stats.map((stat) => [stat.key, stat]));
+    return WEEKDAY_LABELS.map((label, day) => {
+      const stat = byKey.get(String(day));
+      return {
+        key: label,
+        pnl: stat?.pnl ?? 0,
+        count: stat?.count ?? 0,
+        wins: stat?.wins ?? 0,
+        winRate: stat?.winRate ?? 0,
+        avgPnl: stat?.avgPnl ?? 0
+      };
+    });
+  }, [crypto, timeZone]);
+  const byEntryPrice = useMemo(() => {
+    const stats = groupPnl(crypto, (item) => entryPriceBucket(item.entryPrice));
+    const order = new Map(ENTRY_PRICE_BUCKETS.map((bucket, index) => [bucket.label, index]));
+    return [...stats].sort((a, b) => (order.get(a.key) ?? 99) - (order.get(b.key) ?? 99));
+  }, [crypto]);
+
+  return (
+    <div aria-busy={isLoading}>
+      <section className="metricGrid pnlGrid">
+        <MetricCard
+          label="Crypto realized P/L"
+          value={formatSignedUsd(stats.pnl)}
+          detail={`${stats.count} closed markets`}
+          tone={pnlTone(stats.pnl)}
+        />
+        <MetricCard
+          label="Win rate"
+          value={stats.count > 0 ? formatPercent(stats.winRate) : "-"}
+          detail={`${stats.wins} wins · ${stats.count - stats.wins} losses`}
+        />
+        <MetricCard
+          label="Avg P/L per market"
+          value={formatSignedUsd(stats.avgPnl)}
+          detail="Per resolved market"
+          tone={pnlTone(stats.avgPnl)}
+        />
+        <MetricCard
+          label="Best / worst asset"
+          value={byAsset.length > 0 ? byAsset[0].key : "-"}
+          detail={byAsset.length > 0 ? `worst ${byAsset[byAsset.length - 1].key}` : "By total P/L"}
+        />
+      </section>
+
+      {crypto.length === 0 ? (
+        <section className="panel">
+          <div className="emptyState">No closed crypto positions in this range.</div>
+        </section>
+      ) : (
+        <>
+          <section className="contentGrid">
+            <div className="panel">
+              <PanelHeader title="P/L by asset" meta="Realized, this range" />
+              <PnlByGroupChart data={byAsset} />
+            </div>
+            <div className="panel">
+              <PanelHeader title="P/L by direction" meta="Up vs Down" />
+              <PnlByGroupChart data={byDirection} />
+            </div>
+          </section>
+
+          <section className="contentGrid">
+            <div className="panel">
+              <PanelHeader title={`P/L by hour (${tzLabel})`} meta="Entry time" />
+              <PnlByGroupChart data={byHour} />
+            </div>
+            <div className="panel">
+              <PanelHeader title="P/L by entry price" meta="Buy price bucket" />
+              <PnlByGroupChart data={byEntryPrice} />
+            </div>
+          </section>
+
+          <section className="panel">
+            <PanelHeader title={`P/L by weekday (${tzLabel})`} meta="Entry day" />
+            <PnlByGroupChart data={byWeekday} />
+          </section>
+
+          <section className="panel">
+            <ClosedPositionsTable report={report} cryptoOnly />
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PnlByGroupChart({ data }: { data: GroupStat[] }): React.ReactElement {
+  if (data.length === 0) {
+    return <div className="emptyState">No data.</div>;
+  }
+
+  return (
+    <div className="chartWrap">
+      <ResponsiveContainer width="100%" height={240}>
+        <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+          <XAxis dataKey="key" stroke="var(--chart-axis)" tick={{ fontSize: 11 }} minTickGap={4} interval={0} />
+          <YAxis
+            stroke="var(--chart-axis)"
+            tick={{ fontSize: 11 }}
+            width={48}
+            tickFormatter={(value: number) => `$${compactFormatter.format(value)}`}
+          />
+          <Tooltip
+            contentStyle={{
+              background: "var(--chart-tooltip-bg)",
+              border: "1px solid var(--chart-grid)",
+              borderRadius: 10,
+              fontSize: 12
+            }}
+            labelStyle={{ color: "var(--chart-axis)" }}
+            formatter={(value, _name, item) => {
+              const stat = item?.payload as GroupStat | undefined;
+              const winRate = stat ? ` · ${percentFormatter.format(stat.winRate)} win` : "";
+              const count = stat ? ` · ${stat.count} mkts` : "";
+              return [`${formatSignedUsd(Number(value))}${count}${winRate}`, "Realized P/L"];
+            }}
+          />
+          <ReferenceLine y={0} stroke="var(--chart-axis)" strokeDasharray="3 3" />
+          <Bar dataKey="pnl" radius={[3, 3, 0, 0]} maxBarSize={48}>
+            {data.map((entry) => (
+              <Cell key={entry.key} fill={entry.pnl >= 0 ? "var(--green)" : "var(--red)"} />
+            ))}
+          </Bar>
+        </ComposedChart>
+      </ResponsiveContainer>
     </div>
   );
 }
@@ -921,16 +1451,33 @@ function formatPercent(value: number | null | undefined): string {
   return percentFormatter.format(value);
 }
 
-function formatUtcDateTime(timestampSec: number): string {
-  return utcDateTimeFormatter.format(new Date(timestampSec * 1000));
+function formatZonedDateTime(timestampSec: number, timeZone: string): string {
+  return zonedFormatter("datetime", timeZone, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short"
+  }).format(new Date(timestampSec * 1000));
 }
 
-function formatUtcDate(timestampSec: number): string {
-  return utcDateFormatter.format(new Date(timestampSec * 1000));
+function formatZonedDate(timestampSec: number, timeZone: string): string {
+  return zonedFormatter("date", timeZone, { month: "short", day: "numeric" }).format(new Date(timestampSec * 1000));
 }
 
-function formatUtcTime(timestampSec: number): string {
-  return utcTimeFormatter.format(new Date(timestampSec * 1000));
+function formatZonedTime(timestampSec: number, timeZone: string): string {
+  return zonedFormatter("time", timeZone, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(
+    new Date(timestampSec * 1000)
+  );
+}
+
+function zonedHourWeekday(timestampSec: number, timeZone: string): { hour: number; weekday: number } {
+  const parts = zonedParts(timeZone).formatToParts(new Date(timestampSec * 1000));
+  const hourPart = parts.find((part) => part.type === "hour")?.value ?? "0";
+  const weekdayPart = parts.find((part) => part.type === "weekday")?.value ?? "Sun";
+  // hourCycle h23 renders midnight as "24"; normalise it to 0.
+  const hour = Number(hourPart) % 24;
+  return { hour: Number.isFinite(hour) ? hour : 0, weekday: WEEKDAY_INDEX[weekdayPart] ?? 0 };
 }
 
 function toDateInput(date: Date): string {

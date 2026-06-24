@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   aggregatePositions,
   aggregateRebateReport,
+  buildClosedPositions,
   buildRealizedPnl,
   calculateTrade,
   getTier,
   inferTradeCategory,
+  parseCryptoAsset,
   pnlTotal,
   type ActivityEvent,
   type GammaEvent,
@@ -258,5 +260,81 @@ describe("realized pnl from activity", () => {
     expect(realized.losingMarkets).toBe(1);
     // +1 from the redeemed win, -49.5 from the pending loss.
     expect(realized.realizedTotal).toBeCloseTo(-48.5);
+  });
+});
+
+describe("crypto asset parsing", () => {
+  it("extracts the token from updown slugs and maps known symbols", () => {
+    expect(parseCryptoAsset("btc-updown-5m-1782222300")).toEqual({ asset: "BTC", isCrypto: true });
+    expect(parseCryptoAsset("hype-updown-5m-1782222300")).toEqual({ asset: "HYPE", isCrypto: true });
+    expect(parseCryptoAsset("doge-updown-5m-1782222300")).toEqual({ asset: "DOGE", isCrypto: true });
+  });
+
+  it("uppercases unknown updown tokens instead of failing", () => {
+    expect(parseCryptoAsset("ada-updown-5m-1")).toEqual({ asset: "ADA", isCrypto: true });
+    expect(parseCryptoAsset("wif-updown-5m-1")).toEqual({ asset: "WIF", isCrypto: true });
+  });
+
+  it("flags non-crypto markets", () => {
+    expect(parseCryptoAsset("will-trump-win-2028")).toEqual({ asset: "—", isCrypto: false });
+    expect(parseCryptoAsset(null)).toEqual({ asset: "—", isCrypto: false });
+  });
+});
+
+describe("closed positions", () => {
+  it("enriches resolved markets with asset, direction, entry price and proceeds", () => {
+    const trades: PolymarketTrade[] = [
+      { ...cryptoTrade, conditionId: "win", slug: "eth-updown-5m-1", eventSlug: "eth-updown-5m-1", outcome: "Up", size: 100, price: 0.99 },
+      { ...cryptoTrade, conditionId: "loss", slug: "doge-updown-5m-2", eventSlug: "doge-updown-5m-2", outcome: "Down", size: 50, price: 0.98 }
+    ];
+    const markets = [
+      { conditionId: "win", pnl: 1, resolvedAt: 200 },
+      { conditionId: "loss", pnl: -49, resolvedAt: 250 }
+    ];
+
+    const closed = buildClosedPositions(markets, trades);
+
+    expect(closed).toHaveLength(2);
+    // Sorted by resolvedAt desc.
+    const win = closed.find((position) => position.conditionId === "win");
+    expect(win?.asset).toBe("ETH");
+    expect(win?.direction).toBe("Up");
+    expect(win?.isCrypto).toBe(true);
+    expect(win?.entryPrice).toBeCloseTo(0.99);
+    expect(win?.cost).toBeCloseTo(99);
+    expect(win?.proceeds).toBeCloseTo(100);
+    expect(win?.realizedPnl).toBe(1);
+
+    const loss = closed.find((position) => position.conditionId === "loss");
+    expect(loss?.asset).toBe("DOGE");
+    expect(loss?.direction).toBe("Down");
+    expect(loss?.realizedPnl).toBe(-49);
+  });
+
+  it("falls back to the positions snapshot when trades are missing", () => {
+    const position: PolymarketPosition = {
+      proxyWallet: "0x1",
+      asset: "a",
+      conditionId: "orphan",
+      size: 40,
+      avgPrice: 0.95,
+      initialValue: 38,
+      currentValue: 0,
+      cashPnl: 0,
+      percentPnl: 0,
+      realizedPnl: 0,
+      curPrice: 0,
+      redeemable: true,
+      title: "Solana Up or Down",
+      slug: "sol-updown-5m-9",
+      outcome: "Up"
+    };
+
+    const closed = buildClosedPositions([{ conditionId: "orphan", pnl: -38, resolvedAt: 500 }], [], [position]);
+
+    expect(closed[0].asset).toBe("SOL");
+    expect(closed[0].entryPrice).toBeCloseTo(0.95);
+    expect(closed[0].cost).toBeCloseTo(38);
+    expect(closed[0].tradeCount).toBe(0);
   });
 });

@@ -1,4 +1,4 @@
-import type { CalculatedTrade, PolymarketPosition } from "@/lib/rebate";
+import type { ClosedPosition, CalculatedTrade, PolymarketPosition } from "@/lib/rebate";
 
 function escapeCell(value: string | number | null | undefined): string {
   if (value === null || value === undefined) {
@@ -53,6 +53,40 @@ export function tradesToCsv(trades: CalculatedTrade[]): string {
     trade.rawVolume,
     trade.weightedVolume,
     trade.transactionHash ?? ""
+  ]);
+
+  return toCsv(headers, rows);
+}
+
+export function closedPositionsToCsv(items: ClosedPosition[]): string {
+  const headers = [
+    "resolved_utc",
+    "opened_utc",
+    "asset",
+    "market",
+    "direction",
+    "category",
+    "entry_price",
+    "cost",
+    "proceeds",
+    "realized_pnl",
+    "trade_count",
+    "condition_id"
+  ];
+
+  const rows = items.map((item) => [
+    utcIso(item.resolvedAt),
+    utcIso(item.openedAt),
+    item.asset,
+    item.title,
+    item.direction,
+    item.categoryLabel,
+    item.entryPrice ?? "",
+    item.cost,
+    item.proceeds,
+    item.realizedPnl,
+    item.tradeCount,
+    item.conditionId
   ]);
 
   return toCsv(headers, rows);
