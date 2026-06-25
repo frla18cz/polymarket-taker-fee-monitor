@@ -309,7 +309,11 @@ export async function fetchEventsForTrades(
 
 export async function fetchEventBySlug(slug: string, fetchImpl: FetchLike = fetch): Promise<GammaEvent | null> {
   const url = new URL(`/events/slug/${encodeURIComponent(slug)}`, GAMMA_API_BASE);
-  const event = await fetchJson<GammaEvent | null>(url, fetchImpl);
+  // Event metadata (category, fee config) is immutable once a market exists, and active
+  // wallets fan out one fetch per unique market — by far the slowest part of a request.
+  // Cache it in the Next Data Cache, which persists across serverless instances and
+  // deployments on Vercel, so only the first ever lookup of a slug pays the latency.
+  const event = await fetchJson<GammaEvent | null>(url, fetchImpl, GAMMA_EVENT_CACHE);
 
   if (!event || typeof event !== "object") {
     return null;
@@ -318,12 +322,17 @@ export async function fetchEventBySlug(slug: string, fetchImpl: FetchLike = fetc
   return event;
 }
 
-async function fetchJson<T>(url: URL, fetchImpl: FetchLike): Promise<T> {
+// Live trading data (trades, positions, activity, profit) must never be cached.
+const NO_STORE: RequestInit = { cache: "no-store" };
+// Gamma event metadata is stable; revalidate once a day.
+const GAMMA_EVENT_CACHE: RequestInit = { next: { revalidate: 86_400 } };
+
+async function fetchJson<T>(url: URL, fetchImpl: FetchLike, init: RequestInit = NO_STORE): Promise<T> {
   const response = await fetchImpl(url, {
     headers: {
       accept: "application/json"
     },
-    cache: "no-store"
+    ...init
   });
 
   if (!response.ok) {
